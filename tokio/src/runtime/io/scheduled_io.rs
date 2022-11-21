@@ -144,7 +144,7 @@ impl ScheduledIo {
     }
 
     /// Sets the readiness on this `ScheduledIo` by invoking the given closure on
-    /// the current value, returning the previous readiness value.
+    /// the current value, returning whether the change was successful.
     ///
     /// # Arguments
     /// - `token`: the token for this `ScheduledIo`.
@@ -158,7 +158,7 @@ impl ScheduledIo {
     /// If the given token's generation no longer matches the `ScheduledIo`'s
     /// generation, then the corresponding IO resource has been removed and
     /// replaced with a new resource. In that case, this method returns `Err`.
-    /// Otherwise, this returns the previous readiness.
+    /// Otherwise, this returns `Ok`.
     pub(super) fn set_readiness(
         &self,
         token: Option<usize>,

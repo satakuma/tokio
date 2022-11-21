@@ -79,7 +79,7 @@ async fn test_named_pipe_multi_client() -> io::Result<()> {
     const N: usize = 10;
 
     // The first server needs to be constructed early so that clients can
-    // be correctly connected. Otherwise calling .wait will cause the client to
+    // be correctly connected. Otherwise calling .await will cause the client to
     // error.
     let mut server = ServerOptions::new().create(PIPE_NAME)?;
 

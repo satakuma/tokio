@@ -1,7 +1,5 @@
 //! Abstracts out the APIs necessary to `Runtime` for integrating the blocking
-//! pool. When the `blocking` feature flag is **not** enabled, these APIs are
-//! shells. This isolates the complexity of dealing with conditional
-//! compilation.
+//! pool.
 
 mod pool;
 pub(crate) use pool::{spawn_blocking, BlockingPool, Spawner};
