@@ -813,7 +813,7 @@ impl NamedPipeServer {
     /// Tries to read or write from the pipe using a user-provided IO operation.
     ///
     /// If the pipe is ready, the provided closure is called. The closure
-    /// should attempt to perform IO operation from the pipe by manually
+    /// should attempt to perform IO operation on the pipe by manually
     /// calling the appropriate syscall. If the operation fails because the
     /// pipe is not actually ready, then the closure should return a
     /// `WouldBlock` error and the readiness flag is cleared. The return value
@@ -1552,7 +1552,7 @@ impl NamedPipeClient {
     /// Tries to read or write from the pipe using a user-provided IO operation.
     ///
     /// If the pipe is ready, the provided closure is called. The closure
-    /// should attempt to perform IO operation from the pipe by manually
+    /// should attempt to perform IO operation on the pipe by manually
     /// calling the appropriate syscall. If the operation fails because the
     /// pipe is not actually ready, then the closure should return a
     /// `WouldBlock` error and the readiness flag is cleared. The return value
