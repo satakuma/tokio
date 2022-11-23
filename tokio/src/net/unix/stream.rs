@@ -24,7 +24,7 @@ cfg_net_unix! {
     ///
     /// This socket can be connected directly with [`UnixStream::connect`] or accepted
     /// from a listener with [`UnixListener::accept`]. Additionally, a pair of
-    /// anonymous Unix sockets can be created with `UnixStream::pair`.
+    /// anonymous Unix sockets can be created with [`UnixStream::pair`].
     ///
     /// To shut down the stream in the write direction, you can call the
     /// [`shutdown()`] method. This will cause the other peer to receive a read of
