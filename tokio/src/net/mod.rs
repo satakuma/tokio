@@ -49,6 +49,9 @@ cfg_net_unix! {
     pub use unix::datagram::socket::UnixDatagram;
     pub use unix::listener::UnixListener;
     pub use unix::stream::UnixStream;
+
+    mod unix_fifo;
+    pub use unix_fifo::UnixNamedPipe;
 }
 
 cfg_net_windows! {
