@@ -5,7 +5,7 @@
 // triggers this warning but it is safe to ignore in this case.
 #![cfg_attr(not(feature = "sync"), allow(unreachable_pub, dead_code))]
 
-use crate::loom::sync::atomic::AtomicUsize;
+use crate::loom::sync::atomic::{AtomicU16, AtomicUsize};
 use crate::loom::sync::Mutex;
 use crate::util::linked_list::{self, GuardedLinkedList, LinkedList};
 use crate::util::WakeList;
@@ -15,8 +15,8 @@ use std::future::Future;
 use std::marker::PhantomPinned;
 use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::pin::Pin;
-use std::ptr::NonNull;
-use std::sync::atomic::Ordering::SeqCst;
+use std::ptr::{self, NonNull};
+use std::sync::atomic::Ordering::{Acquire, Relaxed, Release, SeqCst};
 use std::task::{Context, Poll, Waker};
 
 type WaitList = LinkedList<Waiter, <Waiter as linked_list::Link>::Target>;
@@ -213,47 +213,59 @@ pub struct Notify {
     waiters: Mutex<WaitList>,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum NotificationType {
-    // Notification triggered by calling `notify_waiters`
-    AllWaiters,
-    // Notification triggered by calling `notify_one`
-    OneWaiter,
-}
-
 #[derive(Debug)]
 struct Waiter {
-    /// Intrusive linked-list pointers.
-    pointers: linked_list::Pointers<Waiter>,
+    /// Linked-list pointers and task's waiter.
+    inner: WaiterInner,
 
-    /// Waiting task's waker.
-    waker: Option<Waker>,
-
-    /// `true` if the notification has been assigned to this waiter.
-    notified: Option<NotificationType>,
-
-    /// Should not be `Unpin`.
-    _p: PhantomPinned,
+    /// Notification assigned to this waiter. It only uses
+    /// `NOTIFICATION_*` values.
+    notification: AtomicU16,
 }
 
 impl Waiter {
     fn new() -> Waiter {
         Waiter {
-            pointers: linked_list::Pointers::new(),
-            waker: None,
-            notified: None,
-            _p: PhantomPinned,
+            inner: WaiterInner {
+                pointers: linked_list::Pointers::new(),
+                waker: None,
+                _p: PhantomPinned,
+            },
+            notification: AtomicU16::new(NOTIFICATION_NONE),
         }
+    }
+
+    unsafe fn project(waiter: *mut Waiter) -> (*mut WaiterInner, *const AtomicU16) {
+        (
+            ptr::addr_of_mut!((*waiter).inner),
+            ptr::addr_of!((*waiter).notification),
+        )
     }
 }
 
 generate_addr_of_methods! {
     impl<> Waiter {
         unsafe fn addr_of_pointers(self: NonNull<Self>) -> NonNull<linked_list::Pointers<Waiter>> {
-            &self.pointers
+            &self.inner.pointers
         }
     }
 }
+
+#[derive(Debug)]
+struct WaiterInner {
+    /// Intrusive linked-list pointers.
+    pointers: linked_list::Pointers<Waiter>,
+
+    /// Waiting task's waker.
+    waker: Option<Waker>,
+
+    /// Should not be `Unpin` because of the pointers.
+    _p: PhantomPinned,
+}
+
+const NOTIFICATION_NONE: u16 = 0;
+const NOTIFICATION_ONE: u16 = 1;
+const NOTIFICATION_ALL: u16 = 2;
 
 /// List used in `Notify::notify_waiters`. It wraps a guarded linked list
 /// and gates the access to it on `notify.waiters` mutex. It also empties
@@ -299,10 +311,13 @@ impl Drop for NotifyWaitersList<'_> {
         // We do not wake the waiters to avoid double panics.
         if !self.is_empty {
             let _lock_guard = self.notify.waiters.lock();
-            while let Some(mut waiter) = self.list.pop_back() {
-                // Safety: we hold the lock.
-                let waiter = unsafe { waiter.as_mut() };
-                waiter.notified = Some(NotificationType::AllWaiters);
+            while let Some(waiter) = self.list.pop_back() {
+                // We hold the lock
+                let notification = unsafe {
+                    let (_, notification) = Waiter::project(waiter.as_ptr());
+                    &*notification
+                };
+                notification.store(NOTIFICATION_ALL, Release);
             }
         }
     }
@@ -607,17 +622,17 @@ impl Notify {
         'outer: loop {
             while wakers.can_push() {
                 match list.pop_back_locked(&mut waiters) {
-                    Some(mut waiter) => {
-                        // Safety: `waiters` lock is still held.
-                        let waiter = unsafe { waiter.as_mut() };
+                    Some(waiter) => {
+                        let (inner, notification) = unsafe {
+                            let (inner, notification) = Waiter::project(waiter.as_ptr());
+                            (&mut *inner, &*notification)
+                        };
 
-                        assert!(waiter.notified.is_none());
-
-                        waiter.notified = Some(NotificationType::AllWaiters);
-
-                        if let Some(waker) = waiter.waker.take() {
+                        if let Some(waker) = inner.waker.take() {
                             wakers.push(waker);
                         }
+
+                        notification.store(NOTIFICATION_ALL, Release);
                     }
                     None => {
                         break 'outer;
@@ -674,15 +689,17 @@ fn notify_locked(waiters: &mut WaitList, state: &AtomicUsize, curr: usize) -> Op
                 // transition **out** of `WAITING`.
                 //
                 // Get a pending waiter
-                let mut waiter = waiters.pop_back().unwrap();
+                let waiter = waiters.pop_back().unwrap();
 
                 // Safety: `waiters` lock is still held.
-                let waiter = unsafe { waiter.as_mut() };
+                let (inner, notification) = unsafe {
+                    let (inner, notification) = Waiter::project(waiter.as_ptr());
+                    (&mut *inner, &*notification)
+                };
 
-                assert!(waiter.notified.is_none());
+                let waker = inner.waker.take();
 
-                waiter.notified = Some(NotificationType::OneWaiter);
-                let waker = waiter.waker.take();
+                notification.store(NOTIFICATION_ONE, Release);
 
                 if waiters.is_empty() {
                     // As this the **final** waiter in the list, the state
@@ -924,7 +941,7 @@ impl Notified<'_> {
                         // The use of `old_waiter` here is not necessary, as the field is always
                         // None when we reach this line.
                         unsafe {
-                            old_waker = std::mem::replace(&mut (*waiter.get()).waker, waker);
+                            old_waker = std::mem::replace(&mut (*waiter.get()).inner.waker, waker);
                         }
                     }
 
@@ -941,26 +958,46 @@ impl Notified<'_> {
                     return Poll::Pending;
                 }
                 Waiting => {
+                    let mut old_waker = None;
+
+                    let (inner_ptr, notification) = unsafe {
+                        let (inner, notification) = Waiter::project(waiter.get());
+                        (inner, &*notification)
+                    };
+
+                    // This could use `Relaxed` followed by a conditional `fence(Acquire)`,
+                    // but loom does not support fences yet.
+                    if notification.load(Acquire) != NOTIFICATION_NONE {
+                        unsafe { &mut *inner_ptr }.waker.take();
+                        notification.store(NOTIFICATION_NONE, Relaxed);
+                        *state = Done;
+                        continue;
+                    }
+
                     // Currently in the "Waiting" state, implying the caller has a waiter stored in
                     // a waiter list (guarded by `notify.waiters`). In order to access the waker
                     // fields, we must acquire the lock.
 
                     let mut waiters = notify.waiters.lock();
 
+                    // Safety: called while locked
+                    let inner = unsafe { &mut *inner_ptr };
+
+                    // We hold the lock and notifications are set only with the lock held,
+                    // so this can be relaxed.
+                    if notification.load(Relaxed) != NOTIFICATION_NONE {
+                        old_waker = inner.waker.take();
+                        notification.store(NOTIFICATION_NONE, Relaxed);
+                        *state = Done;
+                        drop(waiters);
+                        drop(old_waker);
+                        continue;
+                    }
+
                     // Load the state with the lock held.
                     let curr = notify.state.load(SeqCst);
 
-                    // Safety: called while locked
-                    let w = unsafe { &mut *waiter.get() };
-                    let mut old_waker = None;
-
-                    if w.notified.is_some() {
-                        // Our waker has been notified and our waiter is already removed from
-                        // the list. Reset the notification and convert to `Done`.
-                        old_waker = std::mem::take(&mut w.waker);
-                        w.notified = None;
-                        *state = Done;
-                    } else if get_num_notify_waiters_calls(curr) != *notify_waiters_calls {
+                    if get_num_notify_waiters_calls(curr) != *notify_waiters_calls {
                         // Before we add a waiter to the list we check if these numbers are
                         // different while holding the lock. If these numbers are different now,
                         // it means that there is a call to `notify_waiters` in progress and this
@@ -968,22 +1005,23 @@ impl Notified<'_> {
                         // We can treat the waiter as notified and remove it from the list, as
                         // it would have been notified in the `notify_waiters` call anyways.
 
-                        old_waker = std::mem::take(&mut w.waker);
+                        old_waker = std::mem::take(&mut inner.waker);
 
                         // Safety: we hold the lock, so we have an exclusive access to the list.
                         // The list is used in `notify_waiters`, so it must be guarded.
-                        unsafe { waiters.remove(NonNull::new_unchecked(w)) };
+                        unsafe { waiters.remove(NonNull::new_unchecked(waiter.get())) };
 
                         *state = Done;
                     } else {
                         // Update the waker, if necessary.
                         if let Some(waker) = waker {
-                            let should_update = match w.waker.as_ref() {
+                            let should_update = match inner.waker.as_ref() {
                                 Some(current_waker) => !current_waker.will_wake(waker),
                                 None => true,
                             };
                             if should_update {
-                                old_waker = std::mem::replace(&mut w.waker, Some(waker.clone()));
+                                old_waker =
+                                    std::mem::replace(&mut inner.waker, Some(waker.clone()));
                             }
                         }
 
@@ -1047,16 +1085,18 @@ impl Drop for Notified<'_> {
                 notify.state.store(notify_state, SeqCst);
             }
 
+            let notification = unsafe {
+                let (_, notification) = Waiter::project(waiter.get());
+                &*notification
+            };
+
             // See if the node was notified but not received. In this case, if
             // the notification was triggered via `notify_one`, it must be sent
             // to the next waiter.
             //
             // Safety: with the entry removed from the linked list, there can be
             // no concurrent access to the entry
-            if matches!(
-                unsafe { (*waiter.get()).notified },
-                Some(NotificationType::OneWaiter)
-            ) {
+            if notification.load(Relaxed) == NOTIFICATION_ONE {
                 if let Some(waker) = notify_locked(&mut waiters, &notify.state, notify_state) {
                     drop(waiters);
                     waker.wake();
