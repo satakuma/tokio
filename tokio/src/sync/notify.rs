@@ -221,8 +221,8 @@ struct Waiter {
     /// Waiting task's waker.
     waker: UnsafeCell<Option<Waker>>,
 
-    /// Notification assigned to this waiter. It only uses
-    /// `NOTIFICATION_*` values.
+    /// Notification for this waiter. This field is equal to one
+    /// of the `NOTIFICATION_*` constants.
     notification: AtomicUsize,
 
     /// Should not be `Unpin`.
@@ -267,8 +267,8 @@ impl<'a> NotifyWaitersList<'a> {
         guard: Pin<&'a mut Waiter>,
         notify: &'a Notify,
     ) -> NotifyWaitersList<'a> {
-        // Safety: pointer to the guarding waiter is not null.
-        let guard_ptr = unsafe { NonNull::new_unchecked(guard.get_unchecked_mut()) };
+        // Safety: linked list treats waiters as pinned.
+        let guard_ptr = unsafe { NonNull::from(guard.get_unchecked_mut()) };
         let list = unguarded_list.into_guarded(guard_ptr);
         NotifyWaitersList {
             list,
@@ -606,7 +606,7 @@ impl Notify {
                     Some(waiter) => {
                         let waiter_ref = unsafe { waiter.as_ref() };
 
-                        // SAFETY: We hold the lock, so we can access the waker.
+                        // Safety: We hold the lock, so we can access the waker.
                         if let Some(waker) =
                             unsafe { waiter_ref.waker.with_mut(|waker| (*waker).take()) }
                         {
@@ -938,10 +938,9 @@ impl Notified<'_> {
                 return Poll::Pending;
             }
             Waiting => {
-                // This could use `Relaxed` followed by a conditional `fence(Acquire)`,
-                // but loom does not support fences yet.
                 if waiter.notification.load(Acquire) != NOTIFICATION_NONE {
-                    // Safety: waiter is already unlinked and not shared.
+                    // Safety: waiter is already unlinked and will not be shared again,
+                    // so we have an exclusive access to `waker`.
                     unsafe {
                         waiter.waker.with_mut(|waker| (*waker).take());
                     }
@@ -950,18 +949,21 @@ impl Notified<'_> {
                     return Poll::Ready(());
                 }
 
-                // Currently in the "Waiting" state, implying the caller has a waiter stored in
-                // a waiter list (guarded by `notify.waiters`). In order to access the waker
+                // Our waiter was not notified, implying it is still stored in a waiter
+                // list (guarded by `notify.waiters`). In order to access the waker
                 // fields, we must acquire the lock.
 
                 let mut old_waker = None;
                 let mut waiters = notify.waiters.lock();
 
                 // We hold the lock and notifications are set only with the lock held,
-                // so this can be relaxed.
+                // so this can be relaxed, because the happens-before relationship is
+                // established through the mutex.
                 if waiter.notification.load(Relaxed) != NOTIFICATION_NONE {
-                    // Safety: waiter is already unlinked and not shared + we hold the lock.
+                    // Safety: waiter is already unlinked and will not be shared again,
+                    // so we have an exclusive access to `waker`.
                     old_waker = unsafe { waiter.waker.with_mut(|waker| (*waker).take()) };
+
                     waiter.notification.store(NOTIFICATION_NONE, Relaxed);
 
                     // Drop the old waker after releasing the lock.
@@ -983,12 +985,12 @@ impl Notified<'_> {
                     // We can treat the waiter as notified and remove it from the list, as
                     // it would have been notified in the `notify_waiters` call anyways.
 
-                    // Safety: we hold the lock.
+                    // Safety: we hold the lock, so we can modify the waker.
                     old_waker = unsafe { waiter.waker.with_mut(|waker| (*waker).take()) };
 
                     // Safety: we hold the lock, so we have an exclusive access to the list.
-                    // The list is used in `notify_waiters`, so it must be guarded. List treats
-                    // `waiter` as pinned.
+                    // The list is used in `notify_waiters`, so it must be guarded.
+                    // Linked list treats waiters as pinned.
                     unsafe {
                         let waiter_handle = NonNull::from(Pin::into_inner_unchecked(waiter));
                         waiters.remove(waiter_handle);
@@ -1052,14 +1054,16 @@ impl Drop for Notified<'_> {
             let mut waiters = notify.waiters.lock();
             let mut notify_state = notify.state.load(SeqCst);
 
+            // Safety: we hold the lock, so this field is not accessed by `notify_*` functions.
+            // We will unlink the waiter and drop it, so this field will not be mutated again.
             let notification = unsafe { waiter.notification.unsync_load() };
 
             // remove the entry from the list (if not already removed)
             //
             // Safety: we hold the lock, so we have an exclusive access to every list the
             // waiter may be contained in. If the node is not contained in the `waiters`
-            // list, then it is contained by a guarded list used by `notify_waiters` and
-            // in such case it must be a middle node.
+            // list, then it is contained by a guarded list.
+            // Linked list treats waiters as pinned.
             unsafe {
                 let waiter_handle = NonNull::from(Pin::into_inner_unchecked(waiter));
                 waiters.remove(waiter_handle);
@@ -1073,9 +1077,6 @@ impl Drop for Notified<'_> {
             // See if the node was notified but not received. In this case, if
             // the notification was triggered via `notify_one`, it must be sent
             // to the next waiter.
-            //
-            // Safety: with the entry removed from the linked list, there can be
-            // no concurrent access to the entry
             if notification == NOTIFICATION_ONE {
                 if let Some(waker) = notify_locked(&mut waiters, &notify.state, notify_state) {
                     drop(waiters);
