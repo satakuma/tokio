@@ -221,8 +221,8 @@ struct Waiter {
     /// Waiting task's waker.
     waker: UnsafeCell<Option<Waker>>,
 
-    /// Notification for this waiter. This field is equal to one
-    /// of the `NOTIFICATION_*` constants.
+    /// Notification for this waiter. It is an enum and uses
+    /// `NOTIFICATION_{NONE, ONE, ALL}` values.
     notification: AtomicUsize,
 
     /// Should not be `Unpin`.
@@ -248,8 +248,13 @@ generate_addr_of_methods! {
     }
 }
 
+// No notification.
 const NOTIFICATION_NONE: usize = 0;
+
+// Notification type used by `notify_one`.
 const NOTIFICATION_ONE: usize = 1;
+
+// Notification type used by `notify_waiters`.
 const NOTIFICATION_ALL: usize = 2;
 
 /// List used in `Notify::notify_waiters`. It wraps a guarded linked list
@@ -613,7 +618,7 @@ impl Notify {
                             wakers.push(waker);
                         }
 
-                        // This waiter is unlinked and will not be shared ever again.
+                        // This waiter is unlinked and will not be shared ever again, release it.
                         waiter_ref.notification.store(NOTIFICATION_ALL, Release);
                     }
                     None => {
@@ -678,7 +683,7 @@ fn notify_locked(waiters: &mut WaitList, state: &AtomicUsize, curr: usize) -> Op
                 // Safety: We hold the lock, so we can access the waker.
                 let waker = unsafe { waiter_ref.waker.with_mut(|waker| (*waker).take()) };
 
-                // This waiter is unlinked and will not be shared ever again.
+                // This waiter is unlinked and will not be shared ever again, release it.
                 waiter_ref.notification.store(NOTIFICATION_ONE, Release);
 
                 if waiters.is_empty() {
@@ -926,8 +931,8 @@ impl Notified<'_> {
 
                 // Insert the waiter into the linked list
                 //
-                // safety: pointers from `UnsafeCell` are never null.
-                let waiter_handle = unsafe { NonNull::from(Pin::into_inner_unchecked(waiter)) };
+                // Safety: linked list treats waiters as pinned.
+                let waiter_handle = unsafe { NonNull::from(waiter.get_unchecked_mut()) };
                 waiters.push_front(waiter_handle);
 
                 *state = Waiting;
@@ -992,7 +997,7 @@ impl Notified<'_> {
                     // The list is used in `notify_waiters`, so it must be guarded.
                     // Linked list treats waiters as pinned.
                     unsafe {
-                        let waiter_handle = NonNull::from(Pin::into_inner_unchecked(waiter));
+                        let waiter_handle = NonNull::from(waiter.get_unchecked_mut());
                         waiters.remove(waiter_handle);
                     }
 
@@ -1054,8 +1059,9 @@ impl Drop for Notified<'_> {
             let mut waiters = notify.waiters.lock();
             let mut notify_state = notify.state.load(SeqCst);
 
-            // Safety: we hold the lock, so this field is not accessed by `notify_*` functions.
-            // We will unlink the waiter and drop it, so this field will not be mutated again.
+            // Safety: we hold the lock, so this field is not concurrently accessed
+            // by `notify_*` functions. We will unlink the waiter and drop it shortly,
+            // so this field will not be mutated ever again.
             let notification = unsafe { waiter.notification.unsync_load() };
 
             // remove the entry from the list (if not already removed)
@@ -1065,7 +1071,7 @@ impl Drop for Notified<'_> {
             // list, then it is contained by a guarded list.
             // Linked list treats waiters as pinned.
             unsafe {
-                let waiter_handle = NonNull::from(Pin::into_inner_unchecked(waiter));
+                let waiter_handle = NonNull::from(waiter.get_unchecked_mut());
                 waiters.remove(waiter_handle);
             }
 
