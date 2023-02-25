@@ -995,8 +995,8 @@ impl Notified<'_> {
 
                     // Safety: we hold the lock, so we have an exclusive access to the list.
                     // The list is used in `notify_waiters`, so it must be guarded.
-                    // Linked list treats waiters as pinned.
                     unsafe {
+                        // Linked list treats waiters as pinned.
                         let waiter_handle = NonNull::from(waiter.get_unchecked_mut());
                         waiters.remove(waiter_handle);
                     }
@@ -1068,9 +1068,9 @@ impl Drop for Notified<'_> {
             //
             // Safety: we hold the lock, so we have an exclusive access to every list the
             // waiter may be contained in. If the node is not contained in the `waiters`
-            // list, then it is contained by a guarded list.
-            // Linked list treats waiters as pinned.
+            // list, then it is contained by a guarded list used by `notify_waiters`.
             unsafe {
+                // Linked list treats waiters as pinned.
                 let waiter_handle = NonNull::from(waiter.get_unchecked_mut());
                 waiters.remove(waiter_handle);
             }
