@@ -116,7 +116,6 @@ use crate::sync::notify::Notify;
 use crate::loom::sync::atomic::AtomicUsize;
 use crate::loom::sync::atomic::Ordering::Relaxed;
 use crate::loom::sync::{Arc, RwLock, RwLockReadGuard};
-use std::fmt;
 use std::mem;
 use std::ops;
 use std::panic;
@@ -225,6 +224,7 @@ impl<'a, T> Ref<'a, T> {
     }
 }
 
+#[derive(Debug)]
 struct Shared<T> {
     /// The most recent value.
     value: RwLock<T>,
@@ -239,22 +239,10 @@ struct Shared<T> {
     ref_count_rx: AtomicUsize,
 
     /// Notifies waiting receivers that the value changed.
-    notify_rx: big_notify::BigNotify,
+    notify_rx: Notify,
 
     /// Notifies any task listening for `Receiver` dropped events.
     notify_tx: Notify,
-}
-
-impl<T: fmt::Debug> fmt::Debug for Shared<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let state = self.state.load();
-        f.debug_struct("Shared")
-            .field("value", &self.value)
-            .field("version", &state.version())
-            .field("is_closed", &state.is_closed())
-            .field("ref_count_rx", &self.ref_count_rx)
-            .finish()
-    }
 }
 
 pub mod error {
@@ -296,62 +284,6 @@ pub mod error {
     }
 
     impl Error for RecvError {}
-}
-
-mod big_notify {
-    use super::*;
-    use crate::sync::notify::Notified;
-
-    // To avoid contention on the lock inside the `Notify`, we store multiple
-    // copies of it. Then, we use either circular access or randomness to spread
-    // out threads over different `Notify` objects.
-    //
-    // Some simple benchmarks show that randomness performs slightly better than
-    // circular access (probably due to contention on `next`), so we prefer to
-    // use randomness when Tokio is compiled with a random number generator.
-    //
-    // When the random number generator is not available, we fall back to
-    // circular access.
-
-    pub(super) struct BigNotify {
-        #[cfg(not(all(not(loom), feature = "sync", any(feature = "rt", feature = "macros"))))]
-        next: AtomicUsize,
-        inner: [Notify; 8],
-    }
-
-    impl BigNotify {
-        pub(super) fn new() -> Self {
-            Self {
-                #[cfg(not(all(
-                    not(loom),
-                    feature = "sync",
-                    any(feature = "rt", feature = "macros")
-                )))]
-                next: AtomicUsize::new(0),
-                inner: Default::default(),
-            }
-        }
-
-        pub(super) fn notify_waiters(&self) {
-            for notify in &self.inner {
-                notify.notify_waiters();
-            }
-        }
-
-        /// This function implements the case where randomness is not available.
-        #[cfg(not(all(not(loom), feature = "sync", any(feature = "rt", feature = "macros"))))]
-        pub(super) fn notified(&self) -> Notified<'_> {
-            let i = self.next.fetch_add(1, Relaxed) % 8;
-            self.inner[i].notified()
-        }
-
-        /// This function implements the case where randomness is available.
-        #[cfg(all(not(loom), feature = "sync", any(feature = "rt", feature = "macros")))]
-        pub(super) fn notified(&self) -> Notified<'_> {
-            let i = crate::runtime::context::thread_rng_n(8) as usize;
-            self.inner[i].notified()
-        }
-    }
 }
 
 use self::state::{AtomicState, Version};
@@ -485,7 +417,7 @@ pub fn channel<T>(init: T) -> (Sender<T>, Receiver<T>) {
         value: RwLock::new(init),
         state: AtomicState::new(),
         ref_count_rx: AtomicUsize::new(1),
-        notify_rx: big_notify::BigNotify::new(),
+        notify_rx: Notify::new(),
         notify_tx: Notify::new(),
     });
 
